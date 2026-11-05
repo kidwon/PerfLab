@@ -1,0 +1,82 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.security.MessageDigest
+
+ def jmVersion = '5.6.3'
+ def jmHome = layout.buildDirectory.dir("tools/apache-jmeter-${jmVersion}")
+ tasks.register('setupJmeter') {
+    outputs.file(jmHome.map { it.file('.verified') })
+    doLast {
+        def tools = file('build/tools'); tools.mkdirs()
+        def archive = new File(tools, "apache-jmeter-${jmVersion}.zip")
+        def base = "https://archive.apache.org/dist/jmeter/binaries/${archive.name}"
+        new URI(base).toURL().withInputStream { input -> archive.withOutputStream { it << input } }
+        def expected = new URI(base + '.sha512').toURL().text.trim().split(/\s+/)[0]
+        def digest = MessageDigest.getInstance('SHA-512')
+        archive.withInputStream { input -> byte[] buffer = new byte[65536]; int n; while ((n = input.read(buffer)) > 0) digest.update(buffer, 0, n) }
+        if (!digest.digest().encodeHex().toString().equalsIgnoreCase(expected)) throw new GradleException('JMeter SHA512 校验失败')
+        copy { from zipTree(archive); into tools }
+        new File(jmHome.get().asFile,'.verified').text = jmVersion
+    }
+ }
+ ['Smoke':'smoke','Read':'read-load','Mixed':'mixed-load','Bottleneck':'bottleneck'].each { suffix, plan ->
+    tasks.register("jmeter${suffix}") {
+        group = 'verification'
+        dependsOn 'setupJmeter', 'classes'
+        doLast {
+            def integer = { String key, int fallback, int min, int max ->
+                int value
+                try { value = Integer.parseInt(project.findProperty(key)?.toString() ?: fallback.toString()) }
+                catch (Exception e) { throw new GradleException("${key} 必须为整数") }
+                if (value < min || value > max) throw new GradleException("${key} 必须在 ${min}..${max}")
+                value
+            }
+            def host = project.findProperty('host')?.toString() ?: '127.0.0.1'
+            if (!(host in ['127.0.0.1','localhost'])) throw new GradleException('仅允许本地实验：host 必须为 127.0.0.1 或 localhost')
+            def config = [host:host, port:integer('port',8080,1024,65535), threads:integer('threads',suffix=='Smoke'?1:10,1,100), rampUp:integer('rampUp',suffix=='Smoke'?1:10,1,120), duration:integer('duration',suffix=='Smoke'?5:60,1,600), warmUp:integer('warmUp',3,0,60), minId:integer('minId',1,1,Integer.MAX_VALUE), maxId:integer('maxId',100,1,Integer.MAX_VALUE), iterations:integer('iterations',10000,1,5000000), kb:integer('kb',64,1,4096)]
+            if(config.minId > config.maxId) throw new GradleException('minId 不得大于 maxId')
+            def scenario = project.findProperty('scenario')?.toString() ?: 'cpu'
+            def mode = project.findProperty('mode')?.toString() ?: 'indexed'
+            if (!(scenario in ['cpu','alloc','slow-query']) || !(mode in ['indexed','scan','sleep'])) throw new GradleException('无效的 scenario 或 mode')
+            double threshold = Double.parseDouble(project.findProperty('maxErrorRate')?.toString() ?: '0')
+            if (!Double.isFinite(threshold) || threshold < 0 || threshold > 1) throw new GradleException('maxErrorRate 必须为 0..1')
+            def dir = file("build/jmeter-results/${plan}-${new Date().format('yyyyMMdd-HHmmss-SSS')}-${UUID.randomUUID().toString().take(8)}"); dir.mkdirs()
+            def launcher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }.get()
+            // 只读预检：记录真实数据量与服务 JVM 信息，防止将空库 404 当作负载结果。
+            def health = new URI("http://${host}:${config.port}/actuator/health").toURL().openConnection()
+            health.connectTimeout=3000; health.readTimeout=3000
+            if(new JsonSlurper().parse(health.inputStream).status != 'UP') throw new GradleException('服务未就绪')
+            def probe = new URI("http://${host}:${config.port}/api/lab/runtime").toURL().openConnection()
+            probe.connectTimeout=3000; probe.readTimeout=3000
+            def runtime = new JsonSlurper().parse(probe.inputStream)
+            if(runtime.productCount < 1) throw new GradleException('请先运行 generateData')
+            [config.minId,config.maxId].unique().each { id ->
+                def conn = new URI("http://${host}:${config.port}/api/products/${id}").toURL().openConnection()
+                conn.connectTimeout=3000; conn.readTimeout=3000
+                if(conn.responseCode != 200) throw new GradleException("商品 ${id} 不存在，请修正 minId/maxId")
+                conn.inputStream.close()
+            }
+            new File(dir,'metadata.json').text = JsonOutput.prettyPrint(JsonOutput.toJson([parameters:config,scenario:scenario,mode:mode,maxErrorRate:threshold,jmeterVersion:jmVersion,jmeterJava:launcher.metadata.languageVersion.toString(),server:runtime,warmUp:'独立预热线程组，不计入正式 JTL',startedAt:new Date().toString()]))
+            def jar = new File(jmHome.get().asFile,'bin/ApacheJMeter.jar')
+            def common = [launcher.executablePath.asFile.absolutePath,'-Xms128m','-Xmx512m','-jar',jar.absolutePath,'-n','-t',file("jmeter/plans/${plan}.jmx").absolutePath]
+            def props = config.collect { k,v -> "-J${k}=${v}" } + ["-Jscenario=${scenario}","-Jmode=${mode}",'-Jjmeter.save.saveservice.output_format=csv','-Jjmeter.save.saveservice.print_field_names=true','-Jjmeter.save.saveservice.assertion_results_failure_message=true','-Jjmeter.reportgenerator.apdex_satisfied_threshold=500','-Jjmeter.reportgenerator.apdex_tolerated_threshold=1500']
+            if(config.warmUp > 0) {
+                providers.exec { commandLine(common + props + ['-Jphase=warmup',"-j${new File(dir,'warmup.log')}"]) }.result.get().assertNormalExitValue()
+            }
+            providers.exec { commandLine(common + props + ['-Jphase=measure','-l',new File(dir,'results.jtl').absolutePath,'-j',new File(dir,'jmeter.log').absolutePath,'-e','-o',new File(dir,'html').absolutePath]) }.result.get().assertNormalExitValue()
+            // JTL CSV 解析交由 Commons CSV，正确处理带逗号或换行的失败信息。
+            def loader = new URLClassLoader(fileTree(new File(jmHome.get().asFile,'lib')).matching { include '*.jar' }.files.collect { it.toURI().toURL() } as URL[], (ClassLoader)null)
+            try {
+                def formatClass = loader.loadClass('org.apache.commons.csv.CSVFormat')
+                def format = formatClass.getField('DEFAULT').get(null).withFirstRecordAsHeader()
+                def reader = new File(dir,'results.jtl').newReader('UTF-8')
+                def parser = format.parse(reader)
+                long samples=0, errors=0, assertionFailures=0
+                try { parser.each { row -> samples++; if(row.get('success') != 'true') errors++; if(row.isMapped('failureMessage') && !row.get('failureMessage').isEmpty()) assertionFailures++ } } finally { parser.close(); reader.close() }
+                new File(dir,'summary.json').text = JsonOutput.toJson([samples:samples,errors:errors,assertionFailures:assertionFailures,errorRate:samples ? errors/(double)samples : 1])
+                println "报告: ${dir}/html/index.html；samples=${samples}, errors=${errors}"
+                if(samples == 0 || assertionFailures > 0 || errors/(double)samples > threshold) throw new GradleException('无有效样本、响应断言失败或错误率超过 maxErrorRate，详见 JTL')
+            } finally { loader.close() }
+        }
+    }
+ }

@@ -1,0 +1,52 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.5.7'
+    id 'io.spring.dependency-management' version '1.1.7'
+}
+group = 'com.example'
+version = '1.0.0'
+java { toolchain { languageVersion = JavaLanguageVersion.of(17) } }
+repositories { mavenCentral() }
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework.boot:spring-boot-starter-jdbc'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.flywaydb:flyway-core'
+    implementation 'org.flywaydb:flyway-database-postgresql'
+    runtimeOnly 'org.postgresql:postgresql'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+test { useJUnitPlatform() }
+tasks.register('generateData', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.example.perflab.generator.DataGenerator'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+    doFirst {
+        args = ['count','batchSize','seed','truncate','maxCount'].findAll { project.hasProperty(it) }.collect { "--${it}=${project.property(it)}" }
+    }
+}
+['G1':'G1GC', 'ZGC':'ZGC'].each { label, collector ->
+    tasks.register("run${label}", org.springframework.boot.gradle.tasks.run.BootRun) {
+        group = 'application'
+        classpath = sourceSets.main.runtimeClasspath
+        mainClass = 'com.example.perflab.PerformanceLabApplication'
+        javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+        doFirst { file('build/logs').mkdirs() }
+        jvmArgs '-Xms512m', '-Xmx512m', "-XX:+Use${collector}", "-Xlog:gc*:file=build/logs/${label.toLowerCase()}-gc.log:time,uptime,level,tags"
+    }
+}
+apply from: 'gradle/jmeter.gradle'
+
+// Export a small request dataset independently of the bulk product generator.
+tasks.register('exportJmeterIds', JavaExec) {
+    group = 'application'
+    description = 'Export existing product IDs to build/jmeter-data/product-ids.csv'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.example.perflab.generator.ExportJmeterIds'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+    doFirst {
+        args = [project.findProperty('limit')?.toString() ?: '1000']
+    }
+}
