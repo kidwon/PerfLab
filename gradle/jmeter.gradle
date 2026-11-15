@@ -2,6 +2,10 @@ import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import java.security.MessageDigest
 
+// Result parsing has its own dependency; JMeter does not bundle Commons CSV.
+configurations { jmeterResultParser }
+dependencies { jmeterResultParser 'org.apache.commons:commons-csv:1.14.1' }
+
  def jmVersion = '5.6.3'
  def jmHome = layout.buildDirectory.dir("tools/apache-jmeter-${jmVersion}")
  tasks.register('setupJmeter') {
@@ -65,7 +69,7 @@ import java.security.MessageDigest
             }
             providers.exec { commandLine(common + props + ['-Jphase=measure','-l',new File(dir,'results.jtl').absolutePath,'-j',new File(dir,'jmeter.log').absolutePath,'-e','-o',new File(dir,'html').absolutePath]) }.result.get().assertNormalExitValue()
             // JTL CSV 解析交由 Commons CSV，正确处理带逗号或换行的失败信息。
-            def loader = new URLClassLoader(fileTree(new File(jmHome.get().asFile,'lib')).matching { include '*.jar' }.files.collect { it.toURI().toURL() } as URL[], (ClassLoader)null)
+            def loader = new URLClassLoader(configurations.jmeterResultParser.files.collect { it.toURI().toURL() } as URL[], ClassLoader.getPlatformClassLoader())
             try {
                 def formatClass = loader.loadClass('org.apache.commons.csv.CSVFormat')
                 def format = formatClass.getField('DEFAULT').get(null).withFirstRecordAsHeader()
